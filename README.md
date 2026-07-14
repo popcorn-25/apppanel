@@ -1,1 +1,1 @@
-# gopanel
+# apppanel
