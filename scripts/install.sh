@@ -1,12 +1,39 @@
-
 #!/bin/sh
 set -eu
 
 # Manage a verified binary release. The deployed application lives entirely in
 # <install-directory>/apppanel; systemd unit definitions are the only host files.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  c_reset='\033[0m'
+  c_blue='\033[1;34m'
+  c_green='\033[1;32m'
+  c_yellow='\033[1;33m'
+  c_red='\033[1;31m'
+else
+  c_reset='' c_blue='' c_green='' c_yellow='' c_red=''
+fi
+
+line() { printf '%s\n' '------------------------------------------------------------'; }
+info() { printf "${c_blue}[INFO]${c_reset} %s\n" "$*"; }
+success() { printf "${c_green}[ OK ]${c_reset} %s\n" "$*"; }
+warn() { printf "${c_yellow}[WARN]${c_reset} %s\n" "$*" >&2; }
+fail() { printf "${c_red}[FAIL]${c_reset} %s\n" "$*" >&2; exit 1; }
+step() { printf "\n${c_blue}==>${c_reset} %s\n" "$*"; }
+
+banner() {
+  printf "\n${c_blue}AppPanel${c_reset} 安装与管理脚本\n"
+  printf 'GitHub Releases 二进制安装 · SHA-256 完整性校验\n'
+  line
+}
+
+require_commands() {
+  for command in curl tar sha256sum systemctl getent id; do
+    command -v "$command" >/dev/null 2>&1 || fail "缺少必要命令: $command"
+  done
+}
+
 if [ "$(id -u)" -ne 0 ]; then
-  echo "请使用 root 运行此脚本" >&2
-  exit 1
+  fail "请使用 root 运行此脚本"
 fi
 
 stop_and_disable() {
@@ -15,7 +42,7 @@ stop_and_disable() {
 
 confirm() {
   [ "${APPPANEL_ASSUME_YES:-0}" = "1" ] && return 0
-  printf '%s [y/N] ' "$1"
+  printf '%s [y/N] ' "$1" >&2
   read -r answer
   [ "$answer" = "y" ] || [ "$answer" = "Y" ]
 }
@@ -24,9 +51,9 @@ prompt_value() {
   label=$1
   default=${2:-}
   if [ -n "$default" ]; then
-    printf '%s [%s]: ' "$label" "$default"
+    printf '%s [%s]: ' "$label" "$default" >&2
   else
-    printf '%s: ' "$label"
+    printf '%s: ' "$label" >&2
   fi
   read -r value
   printf '%s\n' "${value:-$default}"
@@ -80,11 +107,10 @@ latest_github_release() {
     -H 'Accept: application/vnd.github+json' \
     -H 'User-Agent: AppPanel-Installer' \
     "https://api.github.com/repos/$repository/releases/latest") || {
-      echo "无法从 GitHub 检测最新版本: $repository" >&2
-      exit 1
+      fail "无法从 GitHub 检测最新版本: $repository"
     }
   tag=$(printf '%s' "$response" | tr '\n' ' ' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-  [ -n "$tag" ] || { echo "GitHub 最新发行版未包含 tag_name" >&2; exit 1; }
+  [ -n "$tag" ] || fail "GitHub 最新发行版未包含 tag_name"
   printf '%s\n' "$tag"
 }
 
@@ -100,14 +126,15 @@ write_unit() {
 }
 
 restart_services() {
+  step "重启 AppPanel 服务"
   systemctl daemon-reload
   systemctl enable apppanel-agent caddy apppanel >/dev/null
   for service in apppanel-agent caddy apppanel; do
     systemctl restart "$service"
     systemctl is-active --quiet "$service" || {
-      echo "服务启动失败: $service，请使用 journalctl -u $service -n 100 查看日志" >&2
-      exit 1
+      fail "服务启动失败: $service，请使用 journalctl -u $service -n 100 查看日志"
     }
+    success "$service 服务已启动"
   done
 }
 
@@ -140,7 +167,10 @@ install_or_update() {
   admin_password=${APPPANEL_PASSWORD:-}
   install_dir=${APPPANEL_INSTALL_DIR:-}
 
+  require_commands
+
   if [ "$mode" = "install" ]; then
+    step "配置安装参数"
     [ -n "$install_dir" ] || install_dir=$(prompt_value "安装目录（AppPanel 将安装到此目录下的 apppanel）" "/home")
     install_dir=$(validate_parent_dir "$install_dir")
     root="$install_dir/apppanel"
@@ -162,22 +192,19 @@ install_or_update() {
     aarch64|arm64) arch=arm64 ;;
     *) echo "不支持的 CPU 架构: $(uname -m)" >&2; exit 1 ;;
   esac
-  command -v curl >/dev/null || { echo "需要 curl" >&2; exit 1; }
-  command -v tar >/dev/null || { echo "需要 tar" >&2; exit 1; }
-  command -v sha256sum >/dev/null || { echo "需要 sha256sum" >&2; exit 1; }
-
+  step "检测最新发行版"
   if [ -z "$version" ]; then
     release_tag=$(latest_github_release "$repository")
     version=${release_tag#v}
   else
     release_tag="v$version"
   fi
-  valid_version "$version" || { echo "发行版本无效: $version" >&2; exit 1; }
+  valid_version "$version" || fail "发行版本无效: $version"
   if [ -z "$release_url" ]; then
     release_url="https://github.com/$repository/releases/download/$release_tag"
   fi
   if [ "$mode" = "update" ] && [ -f "$root/VERSION" ] && [ "$(cat "$root/VERSION")" = "$version" ]; then
-    echo "AppPanel 已是最新版本: $version"
+    success "AppPanel 已是最新版本: $version"
     return
   fi
 
@@ -186,13 +213,16 @@ install_or_update() {
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT INT TERM
   base=${release_url%/}
+  info "目标版本: $version"
+  info "安装目录: $root"
+  step "下载并校验发行包"
   curl -fL --retry 3 --retry-delay 2 "$base/$archive" -o "$tmp/$archive"
   curl -fL --retry 3 --retry-delay 2 "$base/$archive.sha256" -o "$tmp/$archive.sha256"
   (cd "$tmp" && sha256sum -c "$archive.sha256")
   tar -xzf "$tmp/$archive" -C "$tmp"
   package="$tmp/$name"
-  [ -f "$package/VERSION" ] || { echo "发行包缺少 VERSION" >&2; exit 1; }
-  [ "$(cat "$package/VERSION")" = "$version" ] || { echo "发行包版本与请求版本不一致" >&2; exit 1; }
+  [ -f "$package/VERSION" ] || fail "发行包缺少 VERSION"
+  [ "$(cat "$package/VERSION")" = "$version" ] || fail "发行包版本与请求版本不一致"
   for path in \
     bin/apppanel \
     bin/apppanel-agent \
@@ -205,9 +235,10 @@ install_or_update() {
     systemd/apppanel-agent.service \
     systemd/caddy.service \
     caddy/Caddyfile; do
-    [ -f "$package/$path" ] || { echo "发行包缺少 $path" >&2; exit 1; }
+    [ -f "$package/$path" ] || fail "发行包缺少 $path"
   done
 
+  step "安装 AppPanel $version"
   getent group apppanel >/dev/null 2>&1 || groupadd --system --gid 1999 apppanel
   id apppanel >/dev/null 2>&1 || useradd --system --gid apppanel --home-dir "$root" --shell /usr/sbin/nologin apppanel
   install -d -m 0750 -o apppanel -g apppanel "$root" "$root/bin" "$root/libexec" "$root/data" "$root/run" "$root/sites" "$root/projects" "$root/node" "$root/go" "$root/mysql" "$root/mariadb" "$root/docker" "$root/caddy"
@@ -221,6 +252,7 @@ install_or_update() {
   done
   install -m 0644 "$package/caddy/Caddyfile" "$root/caddy/Caddyfile"
   if [ ! -x "$root/caddy/caddy" ]; then
+    info "下载 Caddy $caddy_version"
     curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${caddy_version}/caddy_${caddy_version}_linux_${arch}.tar.gz" | tar -xz -C "$root/caddy" caddy
     chmod 0755 "$root/caddy/caddy"
   fi
@@ -247,11 +279,13 @@ install_or_update() {
   chmod 0644 "$root/VERSION"
   if [ "$mode" = "install" ]; then
     bootstrap_admin "$root" "$panel_port" "$admin_login" "$admin_password"
-    echo "AppPanel $version 安装完成: http://服务器IP:$panel_port"
-    echo "安装目录: $root"
-    echo "登录账号: $admin_login"
+    line
+    success "AppPanel $version 安装完成"
+    printf '访问地址: http://服务器IP:%s\n安装目录: %s\n登录账号: %s\n' "$panel_port" "$root" "$admin_login"
+    line
   else
-    echo "AppPanel $version 更新完成，apppanel-agent、Caddy 和面板服务均已重启。安装目录: $root"
+    success "AppPanel $version 更新完成"
+    info "安装目录: $root"
   fi
   trap - EXIT INT TERM
   rm -rf "$tmp"
@@ -262,13 +296,15 @@ uninstall_panel() {
   for arg in "$@"; do
     case "$arg" in
       --purge) purge=true ;;
-      *) echo "未知卸载参数: $arg" >&2; exit 1 ;;
+      *) fail "未知卸载参数: $arg" ;;
     esac
   done
   root=${APPPANEL_ROOT:-}
   [ -n "$root" ] || root=$(service_root)
   [ -n "$root" ] || root=/home/apppanel
-  confirm "将卸载 AppPanel 服务，是否继续？" || { echo "已取消"; return; }
+  warn "卸载默认保留数据、网站、项目和证书。追加 --purge 才会删除安装目录。"
+  confirm "将卸载 AppPanel 服务，是否继续？" || { info "已取消"; return; }
+  step "停止并移除 AppPanel 服务"
   stop_and_disable apppanel.service
   stop_and_disable apppanel-agent.service
   stop_and_disable caddy.service
@@ -283,22 +319,18 @@ uninstall_panel() {
   systemctl daemon-reload
   if [ "$purge" = true ]; then
     rm -rf "$root"
-    echo "AppPanel 已卸载，安装目录已删除: $root"
+    success "AppPanel 已卸载，安装目录已删除: $root"
   else
-    echo "AppPanel 服务已卸载，安装目录已保留: $root"
+    success "AppPanel 服务已卸载，安装目录已保留: $root"
   fi
 }
 
 action=${1:-}
+banner
 if [ -z "$action" ]; then
-  cat <<'EOF'
-
-AppPanel 管理脚本
-1. 安装面板
-2. 更新面板
-3. 卸载面板
-EOF
-  printf '请输入选项 [1-3]: '
+  printf '%s1.%s 安装面板\n%s2.%s 更新面板\n%s3.%s 卸载面板\n' "$c_green" "$c_reset" "$c_blue" "$c_reset" "$c_red" "$c_reset"
+  line
+  printf '请输入选项 [1-3]: ' >&2
   read -r action
 else
   shift
@@ -307,5 +339,5 @@ case "$action" in
   1|install) install_or_update install ;;
   2|update) install_or_update update ;;
   3|uninstall) uninstall_panel "$@" ;;
-  *) echo "无效选项，请输入 1、2 或 3" >&2; exit 1 ;;
+  *) fail "无效选项，请输入 1、2 或 3" ;;
 esac
