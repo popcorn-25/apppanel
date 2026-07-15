@@ -4,11 +4,11 @@ set -eu
 # Manage a verified binary release. The deployed application lives entirely in
 # <install-directory>/apppanel; systemd unit definitions are the only host files.
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
-  c_reset='\033[0m'
-  c_blue='\033[1;34m'
-  c_green='\033[1;32m'
-  c_yellow='\033[1;33m'
-  c_red='\033[1;31m'
+  c_reset=$(printf '\033[0m')
+  c_blue=$(printf '\033[1;34m')
+  c_green=$(printf '\033[1;32m')
+  c_yellow=$(printf '\033[1;33m')
+  c_red=$(printf '\033[1;31m')
 else
   c_reset='' c_blue='' c_green='' c_yellow='' c_red=''
 fi
