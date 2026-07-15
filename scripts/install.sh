@@ -118,6 +118,33 @@ valid_version() {
   printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'
 }
 
+valid_ipv4() (
+  value=$1
+  case "$value" in
+    *[!0-9.]*|'') return 1 ;;
+  esac
+  old_ifs=$IFS
+  IFS=.
+  set -- $value
+  IFS=$old_ifs
+  [ "$#" -eq 4 ] || return 1
+  for octet in "$@"; do
+    [ -n "$octet" ] && [ "$octet" -ge 0 ] 2>/dev/null && [ "$octet" -le 255 ] || return 1
+  done
+)
+
+public_ipv4() {
+  for endpoint in https://api.ipify.org https://ipv4.icanhazip.com; do
+    if candidate=$(curl -4 -fsS --max-time 5 "$endpoint" 2>/dev/null | sed 's/[[:space:]]//g'); then
+      if valid_ipv4 "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
 yaml_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -353,9 +380,15 @@ install_or_update() {
   chmod 0644 "$root/VERSION"
   if [ "$mode" = "install" ]; then
     bootstrap_admin "$root" "$panel_port" "$admin_login" "$admin_password"
+    access_host=服务器IP
+    if detected_ip=$(public_ipv4); then
+      access_host=$detected_ip
+    else
+      warn "未能自动获取公网 IPv4，请使用服务器实际 IP 访问"
+    fi
     line
     success "AppPanel $version 安装完成"
-    printf '访问地址: http://服务器IP:%s\n安装目录: %s\n登录账号: %s\n' "$panel_port" "$root" "$admin_login"
+    printf '访问地址: http://%s:%s\n安装目录: %s\n登录账号: %s\n' "$access_host" "$panel_port" "$root" "$admin_login"
     line
   else
     success "AppPanel $version 更新完成"
