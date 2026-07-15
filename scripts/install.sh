@@ -124,9 +124,10 @@ yaml_escape() {
 
 ensure_port_available() {
   port=$1
+  purpose=${2:-面板}
   command -v ss >/dev/null 2>&1 || return 0
   if ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
-    fail "端口 $port 已被占用，请选择其他面板端口"
+    fail "$purpose 所需端口 $port 已被占用；请先执行 ss -ltnp | grep ':$port ' 确认占用进程"
   fi
 }
 
@@ -195,8 +196,27 @@ bootstrap_admin() {
   [ "$ready" = true ] || fail "面板未在端口 $port 就绪，请检查：journalctl -u apppanel -n 100"
   account=$(json_escape "$login_name")
   password=$(json_escape "$login_password")
-  payload=$(printf '{"dataDir":"%s/data","adminUrl":"http://127.0.0.1:2019","panelUpstream":"127.0.0.1:%s","logListen":"127.0.0.1:2020","logTarget":"127.0.0.1:2020","staticRoot":"%s/sites","panelDomain":"%s","siteName":"AppPanel","adminName":"%s","adminEmail":"%s","adminPassword":"%s","cookieSecure":false}' "$(json_escape "$root")" "$port" "$(json_escape "$root")" "$account" "$account" "$account" "$password")
-  curl -fsS -X POST "http://127.0.0.1:$port/api/v1/install" -H 'Content-Type: application/json' --data "$payload" >/dev/null || fail "管理员初始化失败，请检查：journalctl -u apppanel -n 100"
+  payload=$(printf '{"dataDir":"%s/data","adminUrl":"http://127.0.0.1:2019","panelUpstream":"127.0.0.1:%s","logListen":"127.0.0.1:2020","logTarget":"127.0.0.1:2020","staticRoot":"%s/sites","panelDomain":"","siteName":"AppPanel","adminName":"系统管理员","adminEmail":"%s","adminPassword":"%s","cookieSecure":false}' "$(json_escape "$root")" "$port" "$(json_escape "$root")" "$account" "$password")
+  if ! response=$(curl -sS -X POST "http://127.0.0.1:$port/api/v1/install" -H 'Content-Type: application/json' --data "$payload" -w '\n%{http_code}'); then
+    fail "管理员初始化请求失败，请检查：journalctl -u apppanel -n 100"
+  fi
+  http_status=$(printf '%s\n' "$response" | sed -n '$p')
+  response_body=$(printf '%s\n' "$response" | sed '$d')
+  case "$http_status" in
+    2??) ;;
+    *) fail "管理员初始化失败（HTTP $http_status）：${response_body:-服务未返回错误详情}" ;;
+  esac
+  systemctl restart apppanel
+  ready=false
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -fsS "http://127.0.0.1:$port/api/v1/install/status" 2>/dev/null | grep -q '"installed":true'; then
+      ready=true
+      break
+    fi
+    sleep 1
+  done
+  [ "$ready" = true ] || fail "管理员已创建，但面板未切换到运行模式，请检查：journalctl -u apppanel -n 100"
+  success "管理员已初始化，apppanel 服务已进入运行模式"
 }
 
 install_or_update() {
@@ -226,7 +246,9 @@ install_or_update() {
     [ -n "$panel_port" ] || panel_port=$(prompt_value "面板端口" "18081")
     case "$panel_port" in *[!0-9]*|'') echo "端口必须是 1-65535 的整数" >&2; exit 1;; esac
     [ "$panel_port" -ge 1 ] && [ "$panel_port" -le 65535 ] || { echo "端口必须是 1-65535" >&2; exit 1; }
-    ensure_port_available "$panel_port"
+    ensure_port_available "$panel_port" "面板"
+    ensure_port_available 80 "Caddy HTTP"
+    ensure_port_available 443 "Caddy HTTPS"
     [ -n "$admin_login" ] || admin_login=$(prompt_value "登录账号（作为邮箱使用）" "admin@localhost")
     [ -n "$admin_login" ] || { echo "登录账号不能为空" >&2; exit 1; }
     [ -n "$admin_password" ] || admin_password=$(prompt_password)
