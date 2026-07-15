@@ -328,7 +328,7 @@ uninstall_panel() {
 action=${1:-}
 banner
 if [ -z "$action" ]; then
-  printf '%s1.%s 安装面板\n%s2.%s 更新面板\n%s3.%s 卸载面板\n' "$c_green" "$c_reset" "$c_blue" "$c_reset" "$c_red" "$c_reset"
+  printf "${c_green}1.${c_reset} 安装面板\n${c_blue}2.${c_reset} 更新面板\n${c_red}3.${c_reset} 卸载面板\n"
   line
   printf '请输入选项 [1-3]: ' >&2
   read -r action
