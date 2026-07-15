@@ -118,6 +118,44 @@ valid_version() {
   printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$'
 }
 
+yaml_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+ensure_port_available() {
+  port=$1
+  command -v ss >/dev/null 2>&1 || return 0
+  if ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
+    fail "端口 $port 已被占用，请选择其他面板端口"
+  fi
+}
+
+write_initial_config() {
+  root=$1
+  port=$2
+  config_file="$root/config.yaml"
+  [ -f "$config_file" ] && return
+
+  root_value=$(yaml_escape "$root")
+  {
+    printf '%s\n' 'app_env: production'
+    printf 'http_addr: "0.0.0.0:%s"\n' "$port"
+    printf 'data_dir: "%s/data"\n' "$root_value"
+    printf 'database_path: "%s/data/apppanel.db"\n' "$root_value"
+    printf '%s\n' 'caddy:'
+    printf '%s\n' '  admin_url: "http://127.0.0.1:2019"'
+    printf '%s\n' '  timeout: "10s"'
+    printf '  panel_upstream: "127.0.0.1:%s"\n' "$port"
+    printf '%s\n' '  log_target: "127.0.0.1:2020"'
+    printf '  static_root: "%s/sites"\n' "$root_value"
+    printf '%s\n' 'log_listen: "127.0.0.1:2020"'
+    printf '%s\n' 'session_ttl: "24h"'
+    printf '%s\n' 'cookie_secure: false'
+  } > "$config_file"
+  chown apppanel:apppanel "$config_file"
+  chmod 0640 "$config_file"
+}
+
 write_unit() {
   template=$1
   target=$2
@@ -145,14 +183,20 @@ bootstrap_admin() {
   login_password=$4
   [ -f "$root/data/apppanel.db" ] && return
   command -v curl >/dev/null || return
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    curl -fsS "http://127.0.0.1:$port/api/v1/install/status" >/dev/null 2>&1 && break
+  info "等待面板服务监听 127.0.0.1:$port"
+  ready=false
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if curl -fsS "http://127.0.0.1:$port/api/v1/install/status" >/dev/null 2>&1; then
+      ready=true
+      break
+    fi
     sleep 1
   done
+  [ "$ready" = true ] || fail "面板未在端口 $port 就绪，请检查：journalctl -u apppanel -n 100"
   account=$(json_escape "$login_name")
   password=$(json_escape "$login_password")
   payload=$(printf '{"dataDir":"%s/data","adminUrl":"http://127.0.0.1:2019","panelUpstream":"127.0.0.1:%s","logListen":"127.0.0.1:2020","logTarget":"127.0.0.1:2020","staticRoot":"%s/sites","panelDomain":"%s","siteName":"AppPanel","adminName":"%s","adminEmail":"%s","adminPassword":"%s","cookieSecure":false}' "$(json_escape "$root")" "$port" "$(json_escape "$root")" "$account" "$account" "$account" "$password")
-  curl -fsS -X POST "http://127.0.0.1:$port/api/v1/install" -H 'Content-Type: application/json' --data "$payload" >/dev/null
+  curl -fsS -X POST "http://127.0.0.1:$port/api/v1/install" -H 'Content-Type: application/json' --data "$payload" >/dev/null || fail "管理员初始化失败，请检查：journalctl -u apppanel -n 100"
 }
 
 install_or_update() {
@@ -174,10 +218,15 @@ install_or_update() {
     [ -n "$install_dir" ] || install_dir=$(prompt_value "安装目录（AppPanel 将安装到此目录下的 apppanel）" "/home")
     install_dir=$(validate_parent_dir "$install_dir")
     root="$install_dir/apppanel"
-    [ ! -e "$root" ] || { echo "安装目录已存在: $root" >&2; exit 1; }
+    [ ! -e "$root" ] || {
+      echo "安装目录已存在: $root" >&2
+      echo "若这是未完成的首次安装，请执行：sh install.sh uninstall --purge，然后重新安装" >&2
+      exit 1
+    }
     [ -n "$panel_port" ] || panel_port=$(prompt_value "面板端口" "18081")
     case "$panel_port" in *[!0-9]*|'') echo "端口必须是 1-65535 的整数" >&2; exit 1;; esac
     [ "$panel_port" -ge 1 ] && [ "$panel_port" -le 65535 ] || { echo "端口必须是 1-65535" >&2; exit 1; }
+    ensure_port_available "$panel_port"
     [ -n "$admin_login" ] || admin_login=$(prompt_value "登录账号（作为邮箱使用）" "admin@localhost")
     [ -n "$admin_login" ] || { echo "登录账号不能为空" >&2; exit 1; }
     [ -n "$admin_password" ] || admin_password=$(prompt_password)
@@ -269,6 +318,9 @@ install_or_update() {
     "$root/caddy/caddy" \
     "$root/caddy/Caddyfile"
   chmod 0750 "$root" "$root/bin" "$root/libexec" "$root/caddy"
+  if [ "$mode" = "install" ]; then
+    write_initial_config "$root" "$panel_port"
+  fi
 
   write_unit "$package/systemd/apppanel.service" /etc/systemd/system/apppanel.service "$root"
   write_unit "$package/systemd/apppanel-agent.service" /etc/systemd/system/apppanel-agent.service "$root"
