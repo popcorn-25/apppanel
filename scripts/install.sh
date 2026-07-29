@@ -27,7 +27,7 @@ banner() {
 }
 
 require_commands() {
-  for command in curl tar sha256sum systemctl getent id; do
+  for command in curl tar sha256sum systemctl getent id apt-get; do
     command -v "$command" >/dev/null 2>&1 || fail "缺少必要命令: $command"
   done
 }
@@ -171,7 +171,7 @@ write_initial_config() {
     printf 'data_dir: "%s/data"\n' "$root_value"
     printf 'database_path: "%s/data/apppanel.db"\n' "$root_value"
     printf '%s\n' 'caddy:'
-    printf '%s\n' '  admin_url: "http://127.0.0.1:2019"'
+    printf '  admin_url: "unix://%s/run/caddy/admin.sock"\n' "$root_value"
     printf '%s\n' '  timeout: "10s"'
     printf '  panel_upstream: "127.0.0.1:%s"\n' "$port"
     printf '%s\n' '  log_target: "127.0.0.1:2020"'
@@ -180,8 +180,23 @@ write_initial_config() {
     printf '%s\n' 'session_ttl: "24h"'
     printf '%s\n' 'cookie_secure: false'
   } > "$config_file"
-  chown apppanel:apppanel "$config_file"
-  chmod 0640 "$config_file"
+  chown root:root "$config_file"
+  chmod 0600 "$config_file"
+}
+
+migrate_control_plane_config() {
+  root=$1
+  config_file="$root/config.yaml"
+  [ -f "$config_file" ] || return 0
+  if grep -Fq 'admin_url: "http://127.0.0.1:2019"' "$config_file"; then
+    temporary=$(mktemp "$root/.config.yaml.XXXXXX")
+    sed "s|admin_url: \"http://127.0.0.1:2019\"|admin_url: \"unix://$root/run/caddy/admin.sock\"|" "$config_file" > "$temporary"
+    chown root:root "$temporary"
+    chmod 0600 "$temporary"
+    mv -f "$temporary" "$config_file"
+  fi
+  chown root:root "$config_file"
+  chmod 0600 "$config_file"
 }
 
 write_unit() {
@@ -194,14 +209,58 @@ write_unit() {
 restart_services() {
   step "重启 AppPanel 服务"
   systemctl daemon-reload
+  validate_installed_caddy_config
   systemctl enable apppanel-agent caddy apppanel >/dev/null
   for service in apppanel-agent caddy apppanel; do
-    systemctl restart "$service"
-    systemctl is-active --quiet "$service" || {
-      fail "服务启动失败: $service，请使用 journalctl -u $service -n 100 查看日志"
-    }
+    restart_install_service "$service"
     success "$service 服务已启动"
   done
+}
+
+diagnose_install_service_failure() {
+  service=$1
+  reason=$2
+  install -d -m 0700 -o root -g root "$(dirname "$diagnostic_log")" 2>/dev/null || true
+  {
+    printf '%s\n' '=== AppPanel 安装失败诊断 ==='
+    printf '时间: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '安装开始: %s\n' "$install_started_at"
+    printf '安装目录: %s\n' "$root"
+    printf '\n原因: %s\n' "$reason"
+    printf '\n--- systemctl status %s ---\n' "$service"
+    systemctl status "$service" --no-pager -l -n 0 || true
+    printf '\n--- 本次安装期间的 %s 启动错误/警告 ---\n' "$service"
+    journalctl -u "$service" --since "$install_started_at" --no-pager -o short-iso --grep='level":"(error|warn)"|Failed|failed|exit-code|permission denied|address already in use' || true
+    if [ "$service" = "caddy" ]; then
+      printf '\n--- Caddy 二进制 ---\n'
+      "$root/caddy/caddy" version || true
+      printf '\n--- Caddy 配置校验 ---\n'
+      runuser -u caddy -- "$root/caddy/caddy" validate --config "$root/caddy/Caddyfile" --adapter caddyfile || true
+      printf '\n--- 监听端口（80/443/2019） ---\n'
+      ss -ltnp '( sport = :80 or sport = :443 or sport = :2019 )' || true
+    fi
+  } > "$diagnostic_log" 2>&1 || true
+  chmod 0600 "$diagnostic_log" 2>/dev/null || true
+  echo "安装诊断已保存: $diagnostic_log" >&2
+}
+
+validate_installed_caddy_config() {
+  if ! runuser -u caddy -- "$root/caddy/caddy" validate --config "$root/caddy/Caddyfile" --adapter caddyfile; then
+    diagnose_install_service_failure caddy "Caddy 配置预检失败"
+    fail "Caddy 配置预检失败；请提供诊断文件: $diagnostic_log"
+  fi
+}
+
+restart_install_service() {
+  service=$1
+  if ! systemctl restart "$service"; then
+    diagnose_install_service_failure "$service" "systemctl restart 返回非零"
+    fail "服务启动失败: $service；请提供诊断文件: $diagnostic_log"
+  fi
+  if ! systemctl is-active --quiet "$service"; then
+    diagnose_install_service_failure "$service" "systemctl restart 后服务未处于 active 状态"
+    fail "服务未进入 active 状态: $service；请提供诊断文件: $diagnostic_log"
+  fi
 }
 
 bootstrap_admin() {
@@ -223,7 +282,7 @@ bootstrap_admin() {
   [ "$ready" = true ] || fail "面板未在端口 $port 就绪，请检查：journalctl -u apppanel -n 100"
   account=$(json_escape "$login_name")
   password=$(json_escape "$login_password")
-  payload=$(printf '{"dataDir":"%s/data","adminUrl":"http://127.0.0.1:2019","panelUpstream":"127.0.0.1:%s","logListen":"127.0.0.1:2020","logTarget":"127.0.0.1:2020","staticRoot":"%s/sites","panelDomain":"","siteName":"AppPanel","adminName":"系统管理员","adminEmail":"%s","adminPassword":"%s","cookieSecure":false}' "$(json_escape "$root")" "$port" "$(json_escape "$root")" "$account" "$password")
+  payload=$(printf '{"dataDir":"%s/data","adminUrl":"unix://%s/run/caddy/admin.sock","panelUpstream":"127.0.0.1:%s","logListen":"127.0.0.1:2020","logTarget":"127.0.0.1:2020","staticRoot":"%s/sites","panelDomain":"","siteName":"AppPanel","adminName":"系统管理员","adminEmail":"%s","adminPassword":"%s","cookieSecure":false}' "$(json_escape "$root")" "$(json_escape "$root")" "$port" "$(json_escape "$root")" "$account" "$password")
   if ! response=$(curl -sS -X POST "http://127.0.0.1:$port/api/v1/install" -H 'Content-Type: application/json' --data "$payload" -w '\n%{http_code}'); then
     fail "管理员初始化请求失败，请检查：journalctl -u apppanel -n 100"
   fi
@@ -252,7 +311,6 @@ install_or_update() {
   repository=popcorn-25/apppanel
   version=${APPPANEL_VERSION:-}
   version=${version#v}
-  caddy_version=${CADDY_VERSION:-2.11.4}
   panel_port=${APPPANEL_PORT:-}
   admin_login=${APPPANEL_ADMIN:-}
   admin_password=${APPPANEL_PASSWORD:-}
@@ -284,6 +342,9 @@ install_or_update() {
     [ -n "$root" ] || root=$(service_root)
     [ -n "$root" ] && [ -x "$root/bin/apppanel" ] || { echo "未检测到已安装的 AppPanel；请设置 APPPANEL_ROOT 或选择安装面板" >&2; exit 1; }
   fi
+
+  install_started_at=$(date '+%Y-%m-%d %H:%M:%S')
+  diagnostic_log="${APPPANEL_INSTALL_DIAGNOSTIC_LOG:-$root/data/install-diagnostics/install-$(date '+%Y%m%d-%H%M%S').log}"
 
   case "$(uname -m)" in
     x86_64|amd64) arch=amd64 ;;
@@ -332,44 +393,75 @@ install_or_update() {
     systemd/apppanel.service \
     systemd/apppanel-agent.service \
     systemd/caddy.service \
-    caddy/Caddyfile; do
+    caddy/Caddyfile \
+    caddy/caddy \
+    caddy/caddy.sha256 \
+    caddy/BUILD.json; do
     [ -f "$package/$path" ] || fail "发行包缺少 $path"
+  done
+  (cd "$package/caddy" && sha256sum -c caddy.sha256) || fail "定制 Caddy 校验失败"
+  modules=$("$package/caddy/caddy" list-modules) || fail "无法读取定制 Caddy 模块"
+  printf '%s\n' "$modules" | grep -qx 'http.handlers.apppanel_waf' || fail "定制 Caddy 缺少 AppPanel WAF 模块"
+  printf '%s\n' "$modules" | grep -qx 'http.handlers.lua_waf' || fail "定制 Caddy 缺少旧配置兼容模块"
+  printf '%s\n' "$modules" | grep -qx 'http.handlers.rate_limit' || fail "定制 Caddy 缺少限流模块"
+  release_helpers=""
+  for source in "$package"/libexec/*; do
+    [ -f "$source" ] || continue
+    helper=${source##*/}
+    printf '%s\n' "$helper" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || fail "发行包包含无效工具名称: $helper"
+    release_helpers="$release_helpers $helper"
   done
 
   step "安装 AppPanel $version"
   getent group apppanel >/dev/null 2>&1 || groupadd --system --gid 1999 apppanel
   id apppanel >/dev/null 2>&1 || useradd --system --gid apppanel --home-dir "$root" --shell /usr/sbin/nologin apppanel
-  install -d -m 0750 -o apppanel -g apppanel "$root" "$root/bin" "$root/libexec" "$root/data" "$root/run" "$root/sites" "$root/projects" "$root/node" "$root/go" "$root/mysql" "$root/mariadb" "$root/docker" "$root/caddy"
-  install -d -m 0755 "$root/run/php" "$root/caddy/data" "$root/caddy/config"
-  chmod 0775 "$root/sites"
-
+  getent group apppanel-workload >/dev/null 2>&1 || groupadd --system apppanel-workload
+  id apppanel-workload >/dev/null 2>&1 || useradd --system --gid apppanel-workload --home-dir "$root/projects" --shell /usr/sbin/nologin apppanel-workload
+  getent group caddy >/dev/null 2>&1 || groupadd --system caddy
+  id caddy >/dev/null 2>&1 || useradd --system --gid caddy --home-dir "$root/caddy" --shell /usr/sbin/nologin caddy
+  install -d -m 0751 -o root -g apppanel "$root"
+  install -d -m 0750 -o root -g root "$root/bin" "$root/libexec"
+  install -d -m 0755 -o root -g root "$root/run" "$root/node" "$root/go" "$root/mysql" "$root/mariadb" "$root/docker"
+  install -d -m 0700 -o root -g root "$root/data"
+  install -d -m 0755 -o root -g apppanel "$root/sites"
+  install -d -m 0750 -o apppanel-workload -g apppanel-workload "$root/projects"
+  install -d -m 0750 -o root -g caddy "$root/caddy"
+  install -d -m 0755 -o root -g root "$root/run/php"
+  install -d -m 0700 -o caddy -g caddy "$root/run/caddy"
+  install -d -m 0750 -o caddy -g caddy "$root/caddy/data" "$root/caddy/config"
   install -m 0755 "$package/bin/apppanel" "$root/bin/apppanel"
   install -m 0755 "$package/bin/apppanel-agent" "$root/bin/apppanel-agent"
-  for helper in apppanel-php apppanel-runtime apppanel-database apppanel-docker apppanel-update; do
+  for helper in $release_helpers; do
     install -m 0755 "$package/libexec/$helper" "$root/libexec/$helper"
   done
-  install -m 0644 "$package/caddy/Caddyfile" "$root/caddy/Caddyfile"
-  if [ ! -x "$root/caddy/caddy" ]; then
-    info "下载 Caddy $caddy_version"
-    curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${caddy_version}/caddy_${caddy_version}_linux_${arch}.tar.gz" | tar -xz -C "$root/caddy" caddy
-    chmod 0755 "$root/caddy/caddy"
-  fi
-  chown -R apppanel:apppanel "$root"
-  chown root:apppanel "$root" "$root/bin" "$root/libexec" "$root/caddy"
+  APPPANEL_DATA_DIR="$root/data" "$root/libexec/apppanel-database" migrate-state
+  install -m 0640 "$package/caddy/Caddyfile" "$root/caddy/Caddyfile"
+  install -m 0750 "$package/caddy/caddy" "$root/caddy/caddy"
+  install -m 0644 "$package/caddy/caddy.sha256" "$root/caddy/caddy.sha256"
+  install -m 0644 "$package/caddy/BUILD.json" "$root/caddy/BUILD.json"
+  chown root:root "$root/bin" "$root/libexec"
+  chown root:root "$root/data"
+  chown -R root:root "$root/data"
+  chown root:apppanel "$root" "$root/sites"
+  chown root:caddy "$root/caddy"
+  chown -R apppanel-workload:apppanel-workload "$root/projects"
+  chown -R caddy:caddy "$root/caddy/data" "$root/caddy/config" "$root/run/caddy"
   chown root:root \
     "$root/bin/apppanel" \
     "$root/bin/apppanel-agent" \
-    "$root/libexec/apppanel-php" \
-    "$root/libexec/apppanel-runtime" \
-    "$root/libexec/apppanel-database" \
-    "$root/libexec/apppanel-docker" \
-    "$root/libexec/apppanel-update" \
-    "$root/caddy/caddy" \
-    "$root/caddy/Caddyfile"
-  chmod 0750 "$root" "$root/bin" "$root/libexec" "$root/caddy"
+    "$root/caddy/caddy.sha256" \
+    "$root/caddy/BUILD.json"
+  chown root:caddy "$root/caddy/caddy" "$root/caddy/Caddyfile"
+  for helper in $release_helpers; do
+    chown root:root "$root/libexec/$helper"
+  done
+  chmod 0751 "$root"
+  chmod 0750 "$root/bin" "$root/libexec" "$root/caddy"
+  chmod 0700 "$root/data" "$root/run/caddy"
   if [ "$mode" = "install" ]; then
     write_initial_config "$root" "$panel_port"
   fi
+  migrate_control_plane_config "$root"
 
   write_unit "$package/systemd/apppanel.service" /etc/systemd/system/apppanel.service "$root"
   write_unit "$package/systemd/apppanel-agent.service" /etc/systemd/system/apppanel-agent.service "$root"
