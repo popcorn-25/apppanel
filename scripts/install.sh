@@ -27,7 +27,7 @@ banner() {
 }
 
 require_commands() {
-  for command in curl tar sha256sum systemctl getent id apt-get; do
+  for command in curl tar sha256sum systemctl getent id apt-get runuser env; do
     command -v "$command" >/dev/null 2>&1 || fail "缺少必要命令: $command"
   done
 }
@@ -217,6 +217,15 @@ restart_services() {
   done
 }
 
+run_caddy_as_service_user() {
+  runuser -u caddy -g caddy -G apppanel -- env \
+    APPPANEL_ROOT="$root" \
+    HOME="$root/caddy" \
+    XDG_DATA_HOME="$root/caddy/data" \
+    XDG_CONFIG_HOME="$root/caddy/config" \
+    "$root/caddy/caddy" "$@"
+}
+
 diagnose_install_service_failure() {
   service=$1
   reason=$2
@@ -235,7 +244,7 @@ diagnose_install_service_failure() {
       printf '\n--- Caddy 二进制 ---\n'
       "$root/caddy/caddy" version || true
       printf '\n--- Caddy 配置校验 ---\n'
-      runuser -u caddy -- "$root/caddy/caddy" validate --config "$root/caddy/Caddyfile" --adapter caddyfile || true
+      run_caddy_as_service_user validate --config "$root/caddy/Caddyfile" --adapter caddyfile || true
       printf '\n--- 监听端口（80/443/2019） ---\n'
       ss -ltnp '( sport = :80 or sport = :443 or sport = :2019 )' || true
     fi
@@ -245,7 +254,7 @@ diagnose_install_service_failure() {
 }
 
 validate_installed_caddy_config() {
-  if ! runuser -u caddy -- "$root/caddy/caddy" validate --config "$root/caddy/Caddyfile" --adapter caddyfile; then
+  if ! run_caddy_as_service_user validate --config "$root/caddy/Caddyfile" --adapter caddyfile; then
     diagnose_install_service_failure caddy "Caddy 配置预检失败"
     fail "Caddy 配置预检失败；请提供诊断文件: $diagnostic_log"
   fi
