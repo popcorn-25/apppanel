@@ -156,14 +156,69 @@ yaml_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+kill_port_listeners() {
+  # 结束监听指定端口的用户态进程：先 SIGTERM，5 秒后仍在则 SIGKILL。
+  # PID 1 与脚本自身永不触碰。成功释放返回 0，仍被占用返回 1。
+  port=$1
+  pids=$(ss -ltnp "sport = :$port" 2>/dev/null | grep -o 'pid=[0-9][0-9]*' | cut -d= -f2 | sort -u)
+  [ -n "$pids" ] || return 0
+  for pid in $pids; do
+    case "$pid" in 1|"$$") continue ;; esac
+    if [ -r "/proc/$pid/comm" ]; then
+      info "结束进程 $pid ($(cat "/proc/$pid/comm"))"
+    else
+      info "结束进程 $pid"
+    fi
+    kill "$pid" 2>/dev/null || true
+  done
+  waits=0
+  while [ "$waits" -lt 5 ] && ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; do
+    sleep 1
+    waits=$((waits + 1))
+  done
+  survivors=$(ss -ltnp "sport = :$port" 2>/dev/null | grep -o 'pid=[0-9][0-9]*' | cut -d= -f2 | sort -u)
+  # shellcheck disable=SC2086
+  for pid in $survivors; do
+    case "$pid" in 1|"$$") continue ;; esac
+    warn "进程 $pid 未响应终止信号，强制结束"
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  waits=0
+  while [ "$waits" -lt 5 ] && ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; do
+    sleep 1
+    waits=$((waits + 1))
+  done
+  if ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
+    return 1
+  fi
+}
+
 ensure_port_available() {
   port=$1
   purpose=${2:-面板}
   command -v ss >/dev/null 2>&1 || return 0
-  if ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
-    warn "$purpose 所需端口 $port 已被占用，当前监听进程："
-    ss -ltnp "sport = :$port" >&2 || true
+  if ! ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  warn "$purpose 所需端口 $port 已被占用，当前监听进程："
+  ss -ltnp "sport = :$port" >&2 || true
+  offer_kill=0
+  if [ "${APPPANEL_KILL_PORT_CONFLICTS:-0}" = "1" ]; then
+    offer_kill=1
+  elif [ -t 0 ]; then
+    if confirm "是否强制结束上述进程并继续安装？"; then
+      offer_kill=1
+    fi
+  fi
+  if [ "$offer_kill" -ne 1 ]; then
     fail "请停止占用端口 $port 的进程，或为 $purpose 选择其他端口"
+  fi
+  step "强制结束占用端口 $port 的进程"
+  if kill_port_listeners "$port"; then
+    success "端口 $port 已释放，继续安装"
+  else
+    ss -ltnp "sport = :$port" >&2 || true
+    fail "端口 $port 仍被占用，请手动处理后重试"
   fi
 }
 
@@ -581,12 +636,289 @@ uninstall_panel() {
   fi
 }
 
+# --- APT 发行版官方源切换 ---
+# 只改 Debian/Ubuntu 官方套件条目的 URI（支持 one-line 与 DEB822 两种格式），
+# 第三方源（Caddy、PGDG、Docker 等）一律不动。路径可用环境变量覆盖以便测试：
+# APPPANEL_OS_RELEASE→/etc/os-release，APPPANEL_APT_ETC→/etc/apt，
+# APPPANEL_SKIP_APT_UPDATE=1 跳过改后验证。
+apt_os_release_file=${APPPANEL_OS_RELEASE:-/etc/os-release}
+apt_etc_dir=${APPPANEL_APT_ETC:-/etc/apt}
+
+mirror_choice_label() {
+  case "$1" in tuna) printf '清华源' ;; official) printf '官方源' ;; *) printf '%s' "$1" ;; esac
+}
+
+mirror_detect_distro() {
+  # 输出：<发行版> <代号>，如 "debian trixie"；非 Debian/Ubuntu 返回非零
+  distro_id=$(sed -n 's/^ID=//p' "$apt_os_release_file" 2>/dev/null | tr -d '"' | head -n 1)
+  distro_codename=$(sed -n 's/^VERSION_CODENAME=//p' "$apt_os_release_file" 2>/dev/null | tr -d '"' | head -n 1)
+  case "$distro_id" in debian|ubuntu) ;; *) return 1 ;; esac
+  [ -n "$distro_codename" ] || return 1
+  printf '%s %s\n' "$distro_id" "$distro_codename"
+}
+
+mirror_bases_for() {
+  # 用法：mirror_bases_for <debian|ubuntu> <tuna|official>；输出：<主源> <安全源>
+  case "$1/$2" in
+    debian/tuna) printf 'https://mirrors.tuna.tsinghua.edu.cn/debian/ https://mirrors.tuna.tsinghua.edu.cn/debian-security/\n' ;;
+    debian/official) printf 'http://deb.debian.org/debian/ http://security.debian.org/debian-security/\n' ;;
+    ubuntu/tuna)
+      case "$(uname -m)" in
+        x86_64|amd64) printf 'https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ https://mirrors.tuna.tsinghua.edu.cn/ubuntu/\n' ;;
+        *) printf 'https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/ https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/\n' ;;
+      esac ;;
+    ubuntu/official)
+      case "$(uname -m)" in
+        x86_64|amd64) printf 'http://archive.ubuntu.com/ubuntu/ http://security.ubuntu.com/ubuntu/\n' ;;
+        *) printf 'http://ports.ubuntu.com/ubuntu-ports/ http://ports.ubuntu.com/ubuntu-ports/\n' ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+
+mirror_rewrite_oneline() {
+  # 用法：mirror_rewrite_oneline <文件> <主源> <安全源> <代号> <官方组件>
+  # 三重判定缺一不可：套件是官方套件、URI 路径是发行版仓库路径、组件含官方组件。
+  # 这样借用代号作套件的第三方源（Docker/MySQL 等）不会被误伤。
+  # 返回：0=有改动，1=无改动，其他=失败
+  file=$1; main=$2; sec=$3; codename=$4; comps=$5
+  tmpfile=$(mktemp) || return 2
+  if awk -v main="$main" -v sec="$sec" -v code="$codename" -v comps="$comps" \
+      -v valid="debian debian-security ubuntu ubuntu-ports" '
+    function base_for(suite) {
+      if (suite == code || suite == code "-updates" || suite == code "-backports") return main
+      if (suite == code "-security") return sec
+      return ""
+    }
+    {
+      line = $0
+      if (match(line, /^[[:space:]]*deb(-src)?[[:space:]]+/)) {
+        n = split(line, f)
+        idx = 2
+        if (f[2] ~ /^\[/) {
+          while (idx <= n && f[idx] !~ /\]$/) idx++
+          idx++
+        }
+        nb = base_for(f[idx + 1])
+        if (nb != "") {
+          upath = f[idx]; sub(/^https?:\/\/[^\/]*\//, "", upath); sub(/\/$/, "", upath)
+          nseg = split(upath, seg, "/"); base = seg[nseg]
+          if (index(" " valid " ", " " base " ")) {
+            for (j = idx + 2; j <= n; j++) {
+              if (f[j] ~ /^#/) break
+              if (index(" " comps " ", " " f[j] " ")) { ok = 1; break }
+            }
+          }
+        }
+        if (nb != "" && ok && f[idx] != nb) {
+          f[idx] = nb
+          line = f[1]
+          for (i = 2; i <= n; i++) line = line " " f[i]
+          changed = 1
+        }
+        ok = 0
+      }
+      print line
+    }
+    END { exit changed ? 0 : 1 }
+  ' "$file" > "$tmpfile"; then
+    cat "$tmpfile" > "$file"
+    rm -f "$tmpfile"
+    return 0
+  fi
+  status=$?
+  rm -f "$tmpfile"
+  return "$status"
+}
+
+mirror_rewrite_deb822() {
+  # 用法：mirror_rewrite_deb822 <文件> <主源> <安全源> <代号> <官方组件>
+  # 判定规则同 mirror_rewrite_oneline；返回值也相同。
+  file=$1; main=$2; sec=$3; codename=$4; comps=$5
+  tmpfile=$(mktemp) || return 2
+  if awk -v main="$main" -v sec="$sec" -v code="$codename" -v comps="$comps" \
+      -v valid="debian debian-security ubuntu ubuntu-ports" '
+    function flush() {
+      if (pcount == 0) return
+      nb = ""
+      if (has_sec && !has_main) nb = sec
+      else if (has_main) nb = main
+      for (i = 1; i <= pcount; i++) {
+        if (nb != "" && penabled && ptype_deb && pbase_ok && pcomps_ok && puriline[i] != "" && puri[i] != nb) {
+          p[i] = "URIs: " nb
+          changed = 1
+        }
+        print p[i]
+      }
+      pcount = 0; has_main = 0; has_sec = 0; penabled = 1; ptype_deb = 0
+      pbase_ok = 0; pcomps_ok = 0
+    }
+    BEGIN { penabled = 1 }
+    /^[[:space:]]*$/ { flush(); print; next }
+    {
+      pcount++; p[pcount] = $0
+      if ($0 ~ /^Types:.*deb/) ptype_deb = 1
+      if ($0 ~ /^Enabled:[[:space:]]*no([[:space:]]|$)/) penabled = 0
+      if ($0 ~ /^Suites:/) {
+        s = $0; sub(/^Suites:[[:space:]]*/, "", s)
+        m = split(s, arr)
+        for (k = 1; k <= m; k++) {
+          if (arr[k] == code || arr[k] == code "-updates" || arr[k] == code "-backports") has_main = 1
+          if (arr[k] == code "-security") has_sec = 1
+        }
+      }
+      if ($0 ~ /^Components:/) {
+        c = $0; sub(/^Components:[[:space:]]*/, "", c)
+        m = split(c, arr)
+        for (k = 1; k <= m; k++) {
+          if (index(" " comps " ", " " arr[k] " ")) pcomps_ok = 1
+        }
+      }
+      if ($0 ~ /^URIs:/) {
+        u = $0; sub(/^URIs:[[:space:]]*/, "", u)
+        split(u, ua); puriline[pcount] = 1; puri[pcount] = ua[1]
+        upath = ua[1]; sub(/^https?:\/\/[^\/]*\//, "", upath); sub(/\/$/, "", upath)
+        nseg = split(upath, seg, "/")
+        if (index(" " valid " ", " " seg[nseg] " ")) pbase_ok = 1
+      }
+    }
+    END { flush(); exit changed ? 0 : 1 }
+  ' "$file" > "$tmpfile"; then
+    cat "$tmpfile" > "$file"
+    rm -f "$tmpfile"
+    return 0
+  fi
+  status=$?
+  rm -f "$tmpfile"
+  return "$status"
+}
+
+switch_apt_mirror() {
+  choice=${1:-}
+  if ! distro_info=$(mirror_detect_distro); then
+    fail "仅支持 Debian / Ubuntu 系统（无法从 $apt_os_release_file 识别发行版）"
+  fi
+  set -- $distro_info
+  distro_id=$1; distro_codename=$2
+  case "$distro_id" in
+    debian) official_comps="main contrib non-free non-free-firmware" ;;
+    ubuntu) official_comps="main restricted universe multiverse" ;;
+  esac
+  apt_files=""
+  [ -f "$apt_etc_dir/sources.list" ] && apt_files="$apt_files $apt_etc_dir/sources.list"
+  for ext in list sources; do
+    for f in "$apt_etc_dir/sources.list.d"/*."$ext"; do
+      [ -f "$f" ] || continue
+      apt_files="$apt_files $f"
+    done
+  done
+  # shellcheck disable=SC2086
+  [ -n "$apt_files" ] || fail "在 $apt_etc_dir 下没有找到 apt 源配置文件"
+  current=unknown
+  # shellcheck disable=SC2086
+  if grep -Rqh "mirrors.tuna.tsinghua.edu.cn" $apt_files 2>/dev/null; then
+    current=tuna
+  # shellcheck disable=SC2086
+  elif grep -Rqh -e "deb.debian.org" -e "security.debian.org" -e "archive.ubuntu.com" \
+      -e "security.ubuntu.com" -e "ports.ubuntu.com" $apt_files 2>/dev/null; then
+    current=official
+  fi
+  case "$choice" in
+    tuna|official) ;;
+    "")
+      info "系统版本：$distro_id $distro_codename，当前系统源：$(mirror_choice_label "$current")"
+      if [ ! -t 0 ]; then
+        fail "非交互模式请直接指定：sh install.sh mirror tuna|official"
+      fi
+      printf '请选择目标源 [1-2]（1 清华源，2 官方源）: ' >&2
+      read -r sel || sel=""
+      case "$sel" in 1) choice=tuna ;; 2) choice=official ;; *) fail "未选择有效目标源" ;; esac
+      ;;
+    *) fail "未知源选项：$choice（可用 tuna / official）" ;;
+  esac
+  if [ "$choice" = "$current" ]; then
+    success "当前已是$(mirror_choice_label "$choice")，无需更换"
+    return
+  fi
+  if ! base_info=$(mirror_bases_for "$distro_id" "$choice"); then
+    fail "无法确定 $distro_id 的源地址"
+  fi
+  set -- $base_info
+  main_base=$1; sec_base=$2
+  backup_dir="$apt_etc_dir/apppanel-mirror-backup-$(date '+%Y%m%d-%H%M%S')"
+  mkdir -p "$backup_dir" || fail "无法创建备份目录 $backup_dir"
+  changed_files=0
+  changed_list=""
+  # shellcheck disable=SC2086
+  for f in $apt_files; do
+    orig=$(mktemp) || fail "无法创建临时文件"
+    cp "$f" "$orig"
+    case "$f" in
+      *.sources) mirror_rewrite_deb822 "$f" "$main_base" "$sec_base" "$distro_codename" "$official_comps" ;;
+      *) mirror_rewrite_oneline "$f" "$main_base" "$sec_base" "$distro_codename" "$official_comps" ;;
+    esac
+    if [ "$?" -gt 1 ]; then
+      rm -f "$orig"
+      fail "改写 $f 失败"
+    fi
+    if ! cmp -s "$orig" "$f"; then
+      rel=${f#"$apt_etc_dir"/}
+      mkdir -p "$backup_dir/$(dirname "$rel")"
+      cp "$orig" "$backup_dir/$rel"
+      changed_files=$((changed_files + 1))
+      changed_list="$changed_list $f"
+    fi
+    rm -f "$orig"
+  done
+  if [ "$changed_files" -eq 0 ]; then
+    rmdir "$backup_dir" 2>/dev/null || true
+    success "没有发现需要更换的官方源条目（第三方源保持不动）"
+    return
+  fi
+  info "改写 $changed_files 个文件：$changed_list"
+  info "原文件已备份到 $backup_dir"
+  if ! confirm "确认切换为$(mirror_choice_label "$choice")？"; then
+    # shellcheck disable=SC2086
+    for f in $changed_list; do
+      cp "$backup_dir/${f#"$apt_etc_dir"/}" "$f"
+    done
+    info "已取消，原文件保持不动"
+    return
+  fi
+  if [ "${APPPANEL_SKIP_APT_UPDATE:-0}" != "1" ]; then
+    step "验证新源可用性（apt-get update）"
+    update_log=$(mktemp) || fail "无法创建临时文件"
+    if apt-get update >"$update_log" 2>&1; then
+      rm -f "$update_log"
+    else
+      new_hosts=$(printf '%s\n%s\n' "$main_base" "$sec_base" | sed 's|^https\?://||; s|/.*||' | sort -u)
+      hit_new=0
+      # shellcheck disable=SC2086
+      for h in $new_hosts; do
+        if grep -Eq "^(Err|E:).*$h" "$update_log"; then hit_new=1; fi
+      done
+      if [ "$hit_new" -eq 1 ]; then
+        # shellcheck disable=SC2086
+        for f in $changed_list; do
+          cp "$backup_dir/${f#"$apt_etc_dir"/}" "$f"
+        done
+        rm -f "$update_log"
+        fail "新源不可用，已恢复备份（$backup_dir），请检查网络后重试"
+      fi
+      warn "apt-get update 报告其他源错误（多为第三方源失效），与本次切换无关："
+      grep -E "^(Err|E:)" "$update_log" | head -n 10 >&2 || true
+      rm -f "$update_log"
+    fi
+  fi
+  success "已切换为$(mirror_choice_label "$choice")（原文件备份在 $backup_dir）"
+}
+
 action=${1:-}
 banner
 if [ -z "$action" ]; then
-  printf "${c_green}1.${c_reset} 安装面板\n${c_blue}2.${c_reset} 更新面板\n${c_red}3.${c_reset} 卸载面板\n"
+  printf "${c_green}1.${c_reset} 安装面板\n${c_blue}2.${c_reset} 更新面板\n${c_red}3.${c_reset} 卸载面板\n${c_blue}4.${c_reset} 更换系统软件源\n"
   line
-  printf '请输入选项 [1-3]: ' >&2
+  printf '请输入选项 [1-4]: ' >&2
   read -r action
 else
   shift
@@ -595,5 +927,6 @@ case "$action" in
   1|install) install_or_update install ;;
   2|update) install_or_update update ;;
   3|uninstall) uninstall_panel "$@" ;;
-  *) fail "无效选项，请输入 1、2 或 3" ;;
+  4|mirror) switch_apt_mirror "$@" ;;
+  *) fail "无效选项，请输入 1、2、3 或 4" ;;
 esac
