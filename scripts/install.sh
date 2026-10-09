@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+# sudo 受限环境下 PATH 可能缺 /usr/sbin 等，导致 runuser/ss 等明明存在却报缺失；
+# 先补齐再做任何命令检查。
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
 # Manage a verified binary release. The deployed application lives entirely in
 # <install-directory>/apppanel; systemd unit definitions are the only host files.
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -913,20 +917,43 @@ switch_apt_mirror() {
   success "已切换为$(mirror_choice_label "$choice")（原文件备份在 $backup_dir）"
 }
 
+run_menu_action() {
+  # 交互菜单包装：在子 shell 里跑，成功或失败都不退出脚本，结束后回主菜单。
+  if ( "$@" ); then
+    :
+  else
+    warn "上一步操作未完成，已返回主菜单"
+  fi
+  printf '\n按回车返回主菜单...' >&2
+  read -r _ || true
+}
+
 action=${1:-}
-banner
 if [ -z "$action" ]; then
-  printf "${c_green}1.${c_reset} 安装面板\n${c_blue}2.${c_reset} 更新面板\n${c_red}3.${c_reset} 卸载面板\n${c_blue}4.${c_reset} 更换系统软件源\n"
-  line
-  printf '请输入选项 [1-4]: ' >&2
-  read -r action
+  while true; do
+    banner
+    printf "${c_green}1.${c_reset} 安装面板\n${c_blue}2.${c_reset} 更新面板\n${c_red}3.${c_reset} 卸载面板\n${c_blue}4.${c_reset} 更换系统软件源\n${c_blue}5.${c_reset} 退出\n"
+    line
+    printf '请输入选项 [1-5]: ' >&2
+    read -r action || { info "已退出"; exit 0; }
+    case "$action" in
+      1) run_menu_action install_or_update install ;;
+      2) run_menu_action install_or_update update ;;
+      3) run_menu_action uninstall_panel ;;
+      4) run_menu_action switch_apt_mirror ;;
+      5|q|quit|exit) info "已退出"; exit 0 ;;
+      *) warn "无效选项，请输入 1-5" ;;
+    esac
+  done
 else
   shift
+  banner
 fi
 case "$action" in
   1|install) install_or_update install ;;
   2|update) install_or_update update ;;
   3|uninstall) uninstall_panel "$@" ;;
   4|mirror) switch_apt_mirror "$@" ;;
+  5|q|quit|exit) info "已退出" ;;
   *) fail "无效选项，请输入 1、2、3 或 4" ;;
 esac
