@@ -33,12 +33,10 @@ require_commands() {
 }
 
 ensure_postgresql_client() {
-  if command -v psql >/dev/null 2>&1 && psql --version >/dev/null 2>&1; then
-    return
-  fi
-  step "安装 PostgreSQL 客户端"
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-client
+  # 占位空函数：PostgreSQL 服务端版本由面板按需安装（postgresql-<版本> 包自带
+  # 同版本客户端），连外部库缺客户端时后端会明确报错“请安装 postgresql-client”。
+  # 此处故意不做任何 apt 操作，避免第三方源故障拖死面板安装/更新。
+  return
 }
 
 if [ "$(id -u)" -ne 0 ]; then
