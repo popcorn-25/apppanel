@@ -32,6 +32,15 @@ require_commands() {
   done
 }
 
+ensure_postgresql_client() {
+  if command -v psql >/dev/null 2>&1 && psql --version >/dev/null 2>&1; then
+    return
+  fi
+  step "安装 PostgreSQL 客户端"
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-client
+}
+
 if [ "$(id -u)" -ne 0 ]; then
   fail "请使用 root 运行此脚本"
 fi
@@ -154,8 +163,19 @@ ensure_port_available() {
   purpose=${2:-面板}
   command -v ss >/dev/null 2>&1 || return 0
   if ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
-    fail "$purpose 所需端口 $port 已被占用；请先执行 ss -ltnp | grep ':$port ' 确认占用进程"
+    warn "$purpose 所需端口 $port 已被占用，当前监听进程："
+    ss -ltnp "sport = :$port" >&2 || true
+    fail "请停止占用端口 $port 的进程，或为 $purpose 选择其他端口"
   fi
+}
+
+validate_panel_port() {
+  port=$1
+  case "$port" in
+    80) fail "端口 80 由 Caddy HTTP 站点服务保留，请为 AppPanel 内部服务选择其他端口" ;;
+    443) fail "端口 443 由 Caddy HTTPS 站点服务保留，请为 AppPanel 内部服务选择其他端口" ;;
+    2020) fail "端口 2020 由 AppPanel 访问日志服务保留，请为面板内部服务选择其他端口" ;;
+  esac
 }
 
 write_initial_config() {
@@ -240,6 +260,8 @@ diagnose_install_service_failure() {
     systemctl status "$service" --no-pager -l -n 0 || true
     printf '\n--- 本次安装期间的 %s 启动错误/警告 ---\n' "$service"
     journalctl -u "$service" --since "$install_started_at" --no-pager -o short-iso --grep='level":"(error|warn)"|Failed|failed|exit-code|permission denied|address already in use' || true
+    printf '\n--- %s 最近日志 ---\n' "$service"
+    journalctl -u "$service" --since "$install_started_at" --no-pager -o short-iso -n 100 || true
     if [ "$service" = "caddy" ]; then
       printf '\n--- Caddy 二进制 ---\n'
       "$root/caddy/caddy" version || true
@@ -248,9 +270,35 @@ diagnose_install_service_failure() {
       printf '\n--- 监听端口（80/443/2019） ---\n'
       ss -ltnp '( sport = :80 or sport = :443 or sport = :2019 )' || true
     fi
+    if [ "$service" = "apppanel" ]; then
+      printf '\n--- AppPanel 配置文件与目录权限 ---\n'
+      ls -ld "$root" "$root/bin" "$root/data" "$root/config.yaml" "$root/bin/apppanel" || true
+      printf '\n--- AppPanel 监听端口 ---\n'
+      ss -ltnp || true
+    fi
   } > "$diagnostic_log" 2>&1 || true
   chmod 0600 "$diagnostic_log" 2>/dev/null || true
   echo "安装诊断已保存: $diagnostic_log" >&2
+}
+
+wait_for_panel_endpoint() {
+  port=$1
+  expected=$2
+  attempts=${3:-60}
+  while [ "$attempts" -gt 0 ]; do
+    if ! systemctl is-active --quiet apppanel; then
+      diagnose_install_service_failure apppanel "等待面板就绪期间服务退出"
+      fail "apppanel 服务在等待就绪期间退出；请提供诊断文件: $diagnostic_log"
+    fi
+    response=$(curl -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:$port/api/v1/install/status" 2>/dev/null || true)
+    if printf '%s' "$response" | grep -Fq "$expected"; then
+      return 0
+    fi
+    attempts=$((attempts - 1))
+    [ "$attempts" -gt 0 ] && sleep 1
+  done
+  diagnose_install_service_failure apppanel "面板就绪接口在端口 $port 超时"
+  fail "面板未在端口 $port 就绪；请提供诊断文件: $diagnostic_log"
 }
 
 validate_installed_caddy_config() {
@@ -280,15 +328,7 @@ bootstrap_admin() {
   [ -f "$root/data/apppanel.db" ] && return
   command -v curl >/dev/null || return
   info "等待面板服务监听 127.0.0.1:$port"
-  ready=false
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if curl -fsS "http://127.0.0.1:$port/api/v1/install/status" >/dev/null 2>&1; then
-      ready=true
-      break
-    fi
-    sleep 1
-  done
-  [ "$ready" = true ] || fail "面板未在端口 $port 就绪，请检查：journalctl -u apppanel -n 100"
+  wait_for_panel_endpoint "$port" '"installed":false' 60
   account=$(json_escape "$login_name")
   password=$(json_escape "$login_password")
   payload=$(printf '{"dataDir":"%s/data","adminUrl":"unix://%s/run/caddy/admin.sock","panelUpstream":"127.0.0.1:%s","logListen":"127.0.0.1:2020","logTarget":"127.0.0.1:2020","staticRoot":"%s/sites","panelDomain":"","siteName":"AppPanel","adminName":"系统管理员","adminEmail":"%s","adminPassword":"%s","cookieSecure":false}' "$(json_escape "$root")" "$(json_escape "$root")" "$port" "$(json_escape "$root")" "$account" "$password")
@@ -302,15 +342,7 @@ bootstrap_admin() {
     *) fail "管理员初始化失败（HTTP $http_status）：${response_body:-服务未返回错误详情}" ;;
   esac
   systemctl restart apppanel
-  ready=false
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if curl -fsS "http://127.0.0.1:$port/api/v1/install/status" 2>/dev/null | grep -q '"installed":true'; then
-      ready=true
-      break
-    fi
-    sleep 1
-  done
-  [ "$ready" = true ] || fail "管理员已创建，但面板未切换到运行模式，请检查：journalctl -u apppanel -n 100"
+  wait_for_panel_endpoint "$port" '"installed":true' 30
   success "管理员已初始化，apppanel 服务已进入运行模式"
 }
 
@@ -327,6 +359,8 @@ install_or_update() {
 
   require_commands
 
+  ensure_postgresql_client
+
   if [ "$mode" = "install" ]; then
     step "配置安装参数"
     [ -n "$install_dir" ] || install_dir=$(prompt_value "安装目录（AppPanel 将安装到此目录下的 apppanel）" "/home")
@@ -337,9 +371,10 @@ install_or_update() {
       echo "若这是未完成的首次安装，请执行：sh install.sh uninstall --purge，然后重新安装" >&2
       exit 1
     }
-    [ -n "$panel_port" ] || panel_port=$(prompt_value "面板端口" "18081")
+    [ -n "$panel_port" ] || panel_port=$(prompt_value "AppPanel 内部服务端口" "18081")
     case "$panel_port" in *[!0-9]*|'') echo "端口必须是 1-65535 的整数" >&2; exit 1;; esac
     [ "$panel_port" -ge 1 ] && [ "$panel_port" -le 65535 ] || { echo "端口必须是 1-65535" >&2; exit 1; }
+    validate_panel_port "$panel_port"
     ensure_port_available "$panel_port" "面板"
     ensure_port_available 80 "Caddy HTTP"
     ensure_port_available 443 "Caddy HTTPS"
@@ -402,6 +437,7 @@ install_or_update() {
     systemd/apppanel.service \
     systemd/apppanel-agent.service \
     systemd/caddy.service \
+    systemd/apppanel-docker-bridge-guard.service \
     caddy/Caddyfile \
     caddy/caddy \
     caddy/caddy.sha256 \
@@ -420,6 +456,13 @@ install_or_update() {
     printf '%s\n' "$helper" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || fail "发行包包含无效工具名称: $helper"
     release_helpers="$release_helpers $helper"
   done
+
+  if [ "$mode" = "install" ]; then
+    step "再次确认服务端口"
+    ensure_port_available "$panel_port" "面板"
+    ensure_port_available 80 "Caddy HTTP"
+    ensure_port_available 443 "Caddy HTTPS"
+  fi
 
   step "安装 AppPanel $version"
   getent group apppanel >/dev/null 2>&1 || groupadd --system --gid 1999 apppanel
@@ -475,7 +518,14 @@ install_or_update() {
   write_unit "$package/systemd/apppanel.service" /etc/systemd/system/apppanel.service "$root"
   write_unit "$package/systemd/apppanel-agent.service" /etc/systemd/system/apppanel-agent.service "$root"
   write_unit "$package/systemd/caddy.service" /etc/systemd/system/caddy.service "$root"
+  write_unit "$package/systemd/apppanel-docker-bridge-guard.service" /etc/systemd/system/apppanel-docker-bridge-guard.service "$root"
   restart_services
+  systemctl enable apppanel-docker-bridge-guard.service >/dev/null 2>&1 || true
+  # Docker 由用户在应用商店里按需安装：未安装时该单元无事可做（守护脚本自行跳过），
+  # 因此只在 docker 服务存在时才立即启动，避免安装流程因依赖缺失而失败。
+  if systemctl cat docker.service >/dev/null 2>&1; then
+    systemctl restart apppanel-docker-bridge-guard.service || echo "警告: Docker 网桥自愈未成功，详见 journalctl -u apppanel-docker-bridge-guard" >&2
+  fi
   install -m 0644 "$package/VERSION" "$root/VERSION"
   chown root:root "$root/VERSION"
   chmod 0644 "$root/VERSION"
