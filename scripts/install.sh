@@ -406,7 +406,7 @@ bootstrap_admin() {
 install_or_update() {
   mode=$1
   release_url=${APPPANEL_RELEASE_URL:-}
-  repository=popcorn-25/apppanel
+  repository=popcorn-25/waf.farm
   version=${APPPANEL_VERSION:-}
   version=${version#v}
   panel_port=${APPPANEL_PORT:-}
@@ -869,6 +869,9 @@ switch_apt_mirror() {
       rel=${f#"$apt_etc_dir"/}
       mkdir -p "$backup_dir/$(dirname "$rel")"
       cp "$orig" "$backup_dir/$rel"
+      # mktemp 原文件权限 600，cp 会沿用致备份仅 root 可读；apt 源本就是公开配置，
+      # 保持 644 可读（含测试等非 root 场景回查）。
+      chmod 0644 "$backup_dir/$rel"
       changed_files=$((changed_files + 1))
       changed_list="$changed_list $f"
     fi
