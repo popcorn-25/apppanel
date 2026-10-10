@@ -6,7 +6,7 @@ set -eu
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
 # Manage a verified binary release. The deployed application lives entirely in
-# <install-directory>/apppanel; systemd unit definitions are the only host files.
+# <install-directory>/waf-farm; systemd unit definitions are the only host files.
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   c_reset=$(printf '\033[0m')
   c_blue=$(printf '\033[1;34m')
@@ -25,7 +25,7 @@ fail() { printf "${c_red}[FAIL]${c_reset} %s\n" "$*" >&2; exit 1; }
 step() { printf "\n${c_blue}==>${c_reset} %s\n" "$*"; }
 
 banner() {
-  printf "\n${c_blue}AppPanel${c_reset} 安装与管理脚本\n"
+  printf "\n${c_blue}waf.farm${c_reset} 安装与管理脚本\n"
   printf 'GitHub Releases 二进制安装 · SHA-256 完整性校验\n'
   line
 }
@@ -52,7 +52,7 @@ stop_and_disable() {
 }
 
 confirm() {
-  [ "${APPPANEL_ASSUME_YES:-0}" = "1" ] && return 0
+  [ "${WAF_FARM_ASSUME_YES:-0}" = "1" ] && return 0
   printf '%s [y/N] ' "$1" >&2
   read -r answer
   [ "$answer" = "y" ] || [ "$answer" = "Y" ]
@@ -105,7 +105,7 @@ validate_parent_dir() {
 }
 
 service_root() {
-  sed -n 's/^Environment=APPPANEL_ROOT=//p' /etc/systemd/system/apppanel.service 2>/dev/null | head -n 1
+  sed -n 's/^Environment=WAF_FARM_ROOT=//p' /etc/systemd/system/waf-farm.service 2>/dev/null | head -n 1
 }
 
 github_repository_from_release_url() {
@@ -116,7 +116,7 @@ latest_github_release() {
   repository=$1
   response=$(curl -fsSL --retry 3 --retry-delay 2 \
     -H 'Accept: application/vnd.github+json' \
-    -H 'User-Agent: AppPanel-Installer' \
+    -H 'User-Agent: waf-farm-Installer' \
     "https://api.github.com/repos/$repository/releases/latest") || {
       fail "无法从 GitHub 检测最新版本: $repository"
     }
@@ -207,7 +207,7 @@ ensure_port_available() {
   warn "$purpose 所需端口 $port 已被占用，当前监听进程："
   ss -ltnp "sport = :$port" >&2 || true
   offer_kill=0
-  if [ "${APPPANEL_KILL_PORT_CONFLICTS:-0}" = "1" ]; then
+  if [ "${WAF_FARM_KILL_PORT_CONFLICTS:-0}" = "1" ]; then
     offer_kill=1
   elif [ -t 0 ]; then
     if confirm "是否强制结束上述进程并继续安装？"; then
@@ -229,9 +229,9 @@ ensure_port_available() {
 validate_panel_port() {
   port=$1
   case "$port" in
-    80) fail "端口 80 由 Caddy HTTP 站点服务保留，请为 AppPanel 内部服务选择其他端口" ;;
-    443) fail "端口 443 由 Caddy HTTPS 站点服务保留，请为 AppPanel 内部服务选择其他端口" ;;
-    2020) fail "端口 2020 由 AppPanel 访问日志服务保留，请为面板内部服务选择其他端口" ;;
+    80) fail "端口 80 由 Caddy HTTP 站点服务保留，请为 waf.farm 内部服务选择其他端口" ;;
+    443) fail "端口 443 由 Caddy HTTPS 站点服务保留，请为 waf.farm 内部服务选择其他端口" ;;
+    2020) fail "端口 2020 由 waf.farm 访问日志服务保留，请为面板内部服务选择其他端口" ;;
   esac
 }
 
@@ -246,7 +246,7 @@ write_initial_config() {
     printf '%s\n' 'app_env: production'
     printf 'http_addr: "0.0.0.0:%s"\n' "$port"
     printf 'data_dir: "%s/data"\n' "$root_value"
-    printf 'database_path: "%s/data/apppanel.db"\n' "$root_value"
+    printf 'database_path: "%s/data/waf-farm.db"\n' "$root_value"
     printf '%s\n' 'caddy:'
     printf '  admin_url: "unix://%s/run/caddy/admin.sock"\n' "$root_value"
     printf '%s\n' '  timeout: "10s"'
@@ -280,23 +280,23 @@ write_unit() {
   template=$1
   target=$2
   root=$3
-  sed "s|%APPPANEL_ROOT%|$root|g" "$template" > "$target"
+  sed "s|%WAF_FARM_ROOT%|$root|g" "$template" > "$target"
 }
 
 restart_services() {
-  step "重启 AppPanel 服务"
+  step "重启 waf.farm 服务"
   systemctl daemon-reload
   validate_installed_caddy_config
-  systemctl enable apppanel-agent caddy apppanel >/dev/null
-  for service in apppanel-agent caddy apppanel; do
+  systemctl enable waf-farm-agent caddy waf-farm >/dev/null
+  for service in waf-farm-agent caddy waf-farm; do
     restart_install_service "$service"
     success "$service 服务已启动"
   done
 }
 
 run_caddy_as_service_user() {
-  runuser -u caddy -g caddy -G apppanel -- env \
-    APPPANEL_ROOT="$root" \
+  runuser -u caddy -g caddy -G waf-farm -- env \
+    WAF_FARM_ROOT="$root" \
     HOME="$root/caddy" \
     XDG_DATA_HOME="$root/caddy/data" \
     XDG_CONFIG_HOME="$root/caddy/config" \
@@ -308,7 +308,7 @@ diagnose_install_service_failure() {
   reason=$2
   install -d -m 0700 -o root -g root "$(dirname "$diagnostic_log")" 2>/dev/null || true
   {
-    printf '%s\n' '=== AppPanel 安装失败诊断 ==='
+    printf '%s\n' '=== waf.farm 安装失败诊断 ==='
     printf '时间: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     printf '安装开始: %s\n' "$install_started_at"
     printf '安装目录: %s\n' "$root"
@@ -327,10 +327,10 @@ diagnose_install_service_failure() {
       printf '\n--- 监听端口（80/443/2019） ---\n'
       ss -ltnp '( sport = :80 or sport = :443 or sport = :2019 )' || true
     fi
-    if [ "$service" = "apppanel" ]; then
-      printf '\n--- AppPanel 配置文件与目录权限 ---\n'
-      ls -ld "$root" "$root/bin" "$root/data" "$root/config.yaml" "$root/bin/apppanel" || true
-      printf '\n--- AppPanel 监听端口 ---\n'
+    if [ "$service" = "waf-farm" ]; then
+      printf '\n--- waf.farm 配置文件与目录权限 ---\n'
+      ls -ld "$root" "$root/bin" "$root/data" "$root/config.yaml" "$root/bin/waf-farm" || true
+      printf '\n--- waf.farm 监听端口 ---\n'
       ss -ltnp || true
     fi
   } > "$diagnostic_log" 2>&1 || true
@@ -343,9 +343,9 @@ wait_for_panel_endpoint() {
   expected=$2
   attempts=${3:-60}
   while [ "$attempts" -gt 0 ]; do
-    if ! systemctl is-active --quiet apppanel; then
-      diagnose_install_service_failure apppanel "等待面板就绪期间服务退出"
-      fail "apppanel 服务在等待就绪期间退出；请提供诊断文件: $diagnostic_log"
+    if ! systemctl is-active --quiet waf-farm; then
+      diagnose_install_service_failure waf-farm "等待面板就绪期间服务退出"
+      fail "waf-farm 服务在等待就绪期间退出；请提供诊断文件: $diagnostic_log"
     fi
     response=$(curl -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:$port/api/v1/install/status" 2>/dev/null || true)
     if printf '%s' "$response" | grep -Fq "$expected"; then
@@ -354,7 +354,7 @@ wait_for_panel_endpoint() {
     attempts=$((attempts - 1))
     [ "$attempts" -gt 0 ] && sleep 1
   done
-  diagnose_install_service_failure apppanel "面板就绪接口在端口 $port 超时"
+  diagnose_install_service_failure waf-farm "面板就绪接口在端口 $port 超时"
   fail "面板未在端口 $port 就绪；请提供诊断文件: $diagnostic_log"
 }
 
@@ -382,15 +382,15 @@ bootstrap_admin() {
   port=$2
   login_name=$3
   login_password=$4
-  [ -f "$root/data/apppanel.db" ] && return
+  [ -f "$root/data/waf-farm.db" ] && return
   command -v curl >/dev/null || return
   info "等待面板服务监听 127.0.0.1:$port"
   wait_for_panel_endpoint "$port" '"installed":false' 60
   account=$(json_escape "$login_name")
   password=$(json_escape "$login_password")
-  payload=$(printf '{"dataDir":"%s/data","adminUrl":"unix://%s/run/caddy/admin.sock","panelUpstream":"127.0.0.1:%s","logListen":"127.0.0.1:2020","logTarget":"127.0.0.1:2020","staticRoot":"%s/sites","panelDomain":"","siteName":"AppPanel","adminName":"系统管理员","adminEmail":"%s","adminPassword":"%s","cookieSecure":false}' "$(json_escape "$root")" "$(json_escape "$root")" "$port" "$(json_escape "$root")" "$account" "$password")
+  payload=$(printf '{"dataDir":"%s/data","adminUrl":"unix://%s/run/caddy/admin.sock","panelUpstream":"127.0.0.1:%s","logListen":"127.0.0.1:2020","logTarget":"127.0.0.1:2020","staticRoot":"%s/sites","panelDomain":"","siteName":"waf.farm","adminName":"系统管理员","adminEmail":"%s","adminPassword":"%s","cookieSecure":false}' "$(json_escape "$root")" "$(json_escape "$root")" "$port" "$(json_escape "$root")" "$account" "$password")
   if ! response=$(curl -sS -X POST "http://127.0.0.1:$port/api/v1/install" -H 'Content-Type: application/json' --data "$payload" -w '\n%{http_code}'); then
-    fail "管理员初始化请求失败，请检查：journalctl -u apppanel -n 100"
+    fail "管理员初始化请求失败，请检查：journalctl -u waf-farm -n 100"
   fi
   http_status=$(printf '%s\n' "$response" | sed -n '$p')
   response_body=$(printf '%s\n' "$response" | sed '$d')
@@ -398,21 +398,21 @@ bootstrap_admin() {
     2??) ;;
     *) fail "管理员初始化失败（HTTP $http_status）：${response_body:-服务未返回错误详情}" ;;
   esac
-  systemctl restart apppanel
+  systemctl restart waf-farm
   wait_for_panel_endpoint "$port" '"installed":true' 30
-  success "管理员已初始化，apppanel 服务已进入运行模式"
+  success "管理员已初始化，waf-farm 服务已进入运行模式"
 }
 
 install_or_update() {
   mode=$1
-  release_url=${APPPANEL_RELEASE_URL:-}
+  release_url=${WAF_FARM_RELEASE_URL:-}
   repository=popcorn-25/waf.farm
-  version=${APPPANEL_VERSION:-}
+  version=${WAF_FARM_VERSION:-}
   version=${version#v}
-  panel_port=${APPPANEL_PORT:-}
-  admin_login=${APPPANEL_ADMIN:-}
-  admin_password=${APPPANEL_PASSWORD:-}
-  install_dir=${APPPANEL_INSTALL_DIR:-}
+  panel_port=${WAF_FARM_PORT:-}
+  admin_login=${WAF_FARM_ADMIN:-}
+  admin_password=${WAF_FARM_PASSWORD:-}
+  install_dir=${WAF_FARM_INSTALL_DIR:-}
 
   require_commands
 
@@ -420,15 +420,15 @@ install_or_update() {
 
   if [ "$mode" = "install" ]; then
     step "配置安装参数"
-    [ -n "$install_dir" ] || install_dir=$(prompt_value "安装目录（AppPanel 将安装到此目录下的 apppanel）" "/home")
+    [ -n "$install_dir" ] || install_dir=$(prompt_value "安装目录（waf.farm 将安装到此目录下的 waf-farm）" "/home")
     install_dir=$(validate_parent_dir "$install_dir")
-    root="$install_dir/apppanel"
+    root="$install_dir/waf-farm"
     [ ! -e "$root" ] || {
       echo "安装目录已存在: $root" >&2
       echo "若这是未完成的首次安装，请执行：sh install.sh uninstall --purge，然后重新安装" >&2
       exit 1
     }
-    [ -n "$panel_port" ] || panel_port=$(prompt_value "AppPanel 内部服务端口" "18081")
+    [ -n "$panel_port" ] || panel_port=$(prompt_value "waf.farm 内部服务端口" "18081")
     case "$panel_port" in *[!0-9]*|'') echo "端口必须是 1-65535 的整数" >&2; exit 1;; esac
     [ "$panel_port" -ge 1 ] && [ "$panel_port" -le 65535 ] || { echo "端口必须是 1-65535" >&2; exit 1; }
     validate_panel_port "$panel_port"
@@ -439,13 +439,13 @@ install_or_update() {
     [ -n "$admin_login" ] || { echo "登录账号不能为空" >&2; exit 1; }
     [ -n "$admin_password" ] || admin_password=$(prompt_password)
   else
-    root=${APPPANEL_ROOT:-}
+    root=${WAF_FARM_ROOT:-}
     [ -n "$root" ] || root=$(service_root)
-    [ -n "$root" ] && [ -x "$root/bin/apppanel" ] || { echo "未检测到已安装的 AppPanel；请设置 APPPANEL_ROOT 或选择安装面板" >&2; exit 1; }
+    [ -n "$root" ] && [ -x "$root/bin/waf-farm" ] || { echo "未检测到已安装的 AppPanel；请设置 WAF_FARM_ROOT 或选择安装面板" >&2; exit 1; }
   fi
 
   install_started_at=$(date '+%Y-%m-%d %H:%M:%S')
-  diagnostic_log="${APPPANEL_INSTALL_DIAGNOSTIC_LOG:-$root/data/install-diagnostics/install-$(date '+%Y%m%d-%H%M%S').log}"
+  diagnostic_log="${WAF_FARM_INSTALL_DIAGNOSTIC_LOG:-$root/data/install-diagnostics/install-$(date '+%Y%m%d-%H%M%S').log}"
 
   case "$(uname -m)" in
     x86_64|amd64) arch=amd64 ;;
@@ -464,11 +464,11 @@ install_or_update() {
     release_url="https://github.com/$repository/releases/download/$release_tag"
   fi
   if [ "$mode" = "update" ] && [ -f "$root/VERSION" ] && [ "$(cat "$root/VERSION")" = "$version" ]; then
-    success "AppPanel 已是最新版本: $version"
+    success "waf.farm 已是最新版本: $version"
     return
   fi
 
-  name="apppanel_${version}_linux_${arch}"
+  name="waf-farm_${version}_linux_${arch}"
   archive="$name.tar.gz"
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -484,17 +484,17 @@ install_or_update() {
   [ -f "$package/VERSION" ] || fail "发行包缺少 VERSION"
   [ "$(cat "$package/VERSION")" = "$version" ] || fail "发行包版本与请求版本不一致"
   for path in \
-    bin/apppanel \
-    bin/apppanel-agent \
-    libexec/apppanel-php \
-    libexec/apppanel-runtime \
-    libexec/apppanel-database \
-    libexec/apppanel-docker \
-    libexec/apppanel-update \
-    systemd/apppanel.service \
-    systemd/apppanel-agent.service \
+    bin/waf-farm \
+    bin/waf-farm-agent \
+    libexec/waf-farm-php \
+    libexec/waf-farm-runtime \
+    libexec/waf-farm-database \
+    libexec/waf-farm-docker \
+    libexec/waf-farm-update \
+    systemd/waf-farm.service \
+    systemd/waf-farm-agent.service \
     systemd/caddy.service \
-    systemd/apppanel-docker-bridge-guard.service \
+    systemd/waf-farm-docker-bridge-guard.service \
     caddy/Caddyfile \
     caddy/caddy \
     caddy/caddy.sha256 \
@@ -503,7 +503,7 @@ install_or_update() {
   done
   (cd "$package/caddy" && sha256sum -c caddy.sha256) || fail "定制 Caddy 校验失败"
   modules=$("$package/caddy/caddy" list-modules) || fail "无法读取定制 Caddy 模块"
-  printf '%s\n' "$modules" | grep -qx 'http.handlers.apppanel_waf' || fail "定制 Caddy 缺少 AppPanel WAF 模块"
+  printf '%s\n' "$modules" | grep -qx 'http.handlers.waf_farm_waf' || fail "定制 Caddy 缺少 AppPanel WAF 模块"
   printf '%s\n' "$modules" | grep -qx 'http.handlers.lua_waf' || fail "定制 Caddy 缺少旧配置兼容模块"
   printf '%s\n' "$modules" | grep -qx 'http.handlers.rate_limit' || fail "定制 Caddy 缺少限流模块"
   release_helpers=""
@@ -521,29 +521,29 @@ install_or_update() {
     ensure_port_available 443 "Caddy HTTPS"
   fi
 
-  step "安装 AppPanel $version"
-  getent group apppanel >/dev/null 2>&1 || groupadd --system --gid 1999 apppanel
-  id apppanel >/dev/null 2>&1 || useradd --system --gid apppanel --home-dir "$root" --shell /usr/sbin/nologin apppanel
-  getent group apppanel-workload >/dev/null 2>&1 || groupadd --system apppanel-workload
-  id apppanel-workload >/dev/null 2>&1 || useradd --system --gid apppanel-workload --home-dir "$root/projects" --shell /usr/sbin/nologin apppanel-workload
+  step "安装 waf.farm $version"
+  getent group waf-farm >/dev/null 2>&1 || groupadd --system --gid 1999 waf-farm
+  id waf-farm >/dev/null 2>&1 || useradd --system --gid waf-farm --home-dir "$root" --shell /usr/sbin/nologin waf-farm
+  getent group waf-farm-workload >/dev/null 2>&1 || groupadd --system waf-farm-workload
+  id waf-farm-workload >/dev/null 2>&1 || useradd --system --gid waf-farm-workload --home-dir "$root/projects" --shell /usr/sbin/nologin waf-farm-workload
   getent group caddy >/dev/null 2>&1 || groupadd --system caddy
   id caddy >/dev/null 2>&1 || useradd --system --gid caddy --home-dir "$root/caddy" --shell /usr/sbin/nologin caddy
-  install -d -m 0751 -o root -g apppanel "$root"
+  install -d -m 0751 -o root -g waf-farm "$root"
   install -d -m 0750 -o root -g root "$root/bin" "$root/libexec"
   install -d -m 0755 -o root -g root "$root/run" "$root/node" "$root/go" "$root/mysql" "$root/mariadb" "$root/docker"
   install -d -m 0700 -o root -g root "$root/data"
-  install -d -m 0755 -o root -g apppanel "$root/sites"
-  install -d -m 0750 -o apppanel-workload -g apppanel-workload "$root/projects"
+  install -d -m 0755 -o root -g waf-farm "$root/sites"
+  install -d -m 0750 -o waf-farm-workload -g waf-farm-workload "$root/projects"
   install -d -m 0750 -o root -g caddy "$root/caddy"
   install -d -m 0755 -o root -g root "$root/run/php"
   install -d -m 0700 -o caddy -g caddy "$root/run/caddy"
   install -d -m 0750 -o caddy -g caddy "$root/caddy/data" "$root/caddy/config"
-  install -m 0755 "$package/bin/apppanel" "$root/bin/apppanel"
-  install -m 0755 "$package/bin/apppanel-agent" "$root/bin/apppanel-agent"
+  install -m 0755 "$package/bin/waf-farm" "$root/bin/waf-farm"
+  install -m 0755 "$package/bin/waf-farm-agent" "$root/bin/waf-farm-agent"
   for helper in $release_helpers; do
     install -m 0755 "$package/libexec/$helper" "$root/libexec/$helper"
   done
-  APPPANEL_DATA_DIR="$root/data" "$root/libexec/apppanel-database" migrate-state
+  WAF_FARM_DATA_DIR="$root/data" "$root/libexec/waf-farm-database" migrate-state
   install -m 0640 "$package/caddy/Caddyfile" "$root/caddy/Caddyfile"
   install -m 0750 "$package/caddy/caddy" "$root/caddy/caddy"
   install -m 0644 "$package/caddy/caddy.sha256" "$root/caddy/caddy.sha256"
@@ -551,13 +551,13 @@ install_or_update() {
   chown root:root "$root/bin" "$root/libexec"
   chown root:root "$root/data"
   chown -R root:root "$root/data"
-  chown root:apppanel "$root" "$root/sites"
+  chown root:waf-farm "$root" "$root/sites"
   chown root:caddy "$root/caddy"
-  chown -R apppanel-workload:apppanel-workload "$root/projects"
+  chown -R waf-farm-workload:waf-farm-workload "$root/projects"
   chown -R caddy:caddy "$root/caddy/data" "$root/caddy/config" "$root/run/caddy"
   chown root:root \
-    "$root/bin/apppanel" \
-    "$root/bin/apppanel-agent" \
+    "$root/bin/waf-farm" \
+    "$root/bin/waf-farm-agent" \
     "$root/caddy/caddy.sha256" \
     "$root/caddy/BUILD.json"
   chown root:caddy "$root/caddy/caddy" "$root/caddy/Caddyfile"
@@ -572,16 +572,16 @@ install_or_update() {
   fi
   migrate_control_plane_config "$root"
 
-  write_unit "$package/systemd/apppanel.service" /etc/systemd/system/apppanel.service "$root"
-  write_unit "$package/systemd/apppanel-agent.service" /etc/systemd/system/apppanel-agent.service "$root"
+  write_unit "$package/systemd/waf-farm.service" /etc/systemd/system/waf-farm.service "$root"
+  write_unit "$package/systemd/waf-farm-agent.service" /etc/systemd/system/waf-farm-agent.service "$root"
   write_unit "$package/systemd/caddy.service" /etc/systemd/system/caddy.service "$root"
-  write_unit "$package/systemd/apppanel-docker-bridge-guard.service" /etc/systemd/system/apppanel-docker-bridge-guard.service "$root"
+  write_unit "$package/systemd/waf-farm-docker-bridge-guard.service" /etc/systemd/system/waf-farm-docker-bridge-guard.service "$root"
   restart_services
-  systemctl enable apppanel-docker-bridge-guard.service >/dev/null 2>&1 || true
+  systemctl enable waf-farm-docker-bridge-guard.service >/dev/null 2>&1 || true
   # Docker 由用户在应用商店里按需安装：未安装时该单元无事可做（守护脚本自行跳过），
   # 因此只在 docker 服务存在时才立即启动，避免安装流程因依赖缺失而失败。
   if systemctl cat docker.service >/dev/null 2>&1; then
-    systemctl restart apppanel-docker-bridge-guard.service || echo "警告: Docker 网桥自愈未成功，详见 journalctl -u apppanel-docker-bridge-guard" >&2
+    systemctl restart waf-farm-docker-bridge-guard.service || echo "警告: Docker 网桥自愈未成功，详见 journalctl -u waf-farm-docker-bridge-guard" >&2
   fi
   install -m 0644 "$package/VERSION" "$root/VERSION"
   chown root:root "$root/VERSION"
@@ -595,11 +595,11 @@ install_or_update() {
       warn "未能自动获取公网 IPv4，请使用服务器实际 IP 访问"
     fi
     line
-    success "AppPanel $version 安装完成"
+    success "waf.farm $version 安装完成"
     printf '访问地址: http://%s:%s\n安装目录: %s\n登录账号: %s\n' "$access_host" "$panel_port" "$root" "$admin_login"
     line
   else
-    success "AppPanel $version 更新完成"
+    success "waf.farm $version 更新完成"
     info "安装目录: $root"
   fi
   trap - EXIT INT TERM
@@ -614,39 +614,39 @@ uninstall_panel() {
       *) fail "未知卸载参数: $arg" ;;
     esac
   done
-  root=${APPPANEL_ROOT:-}
+  root=${WAF_FARM_ROOT:-}
   [ -n "$root" ] || root=$(service_root)
-  [ -n "$root" ] || root=/home/apppanel
+  [ -n "$root" ] || root=/home/waf-farm
   warn "卸载默认保留数据、网站、项目和证书。追加 --purge 才会删除安装目录。"
-  confirm "将卸载 AppPanel 服务，是否继续？" || { info "已取消"; return; }
-  step "停止并移除 AppPanel 服务"
-  stop_and_disable apppanel.service
-  stop_and_disable apppanel-agent.service
+  confirm "将卸载 waf.farm 服务，是否继续？" || { info "已取消"; return; }
+  step "停止并移除 waf.farm 服务"
+  stop_and_disable waf-farm.service
+  stop_and_disable waf-farm-agent.service
   stop_and_disable caddy.service
-  stop_and_disable apppanel-mysql.service
-  stop_and_disable apppanel-mariadb.service
-  for path in /etc/systemd/system/apppanel-project-*.service; do
+  stop_and_disable waf-farm-mysql.service
+  stop_and_disable waf-farm-mariadb.service
+  for path in /etc/systemd/system/waf-farm-project-*.service; do
     [ -e "$path" ] || continue
     stop_and_disable "$(basename "$path")"
     rm -f "$path"
   done
-  rm -f /etc/systemd/system/apppanel.service /etc/systemd/system/apppanel-agent.service /etc/systemd/system/caddy.service /etc/systemd/system/apppanel-mysql.service /etc/systemd/system/apppanel-mariadb.service
+  rm -f /etc/systemd/system/waf-farm.service /etc/systemd/system/waf-farm-agent.service /etc/systemd/system/caddy.service /etc/systemd/system/waf-farm-mysql.service /etc/systemd/system/waf-farm-mariadb.service
   systemctl daemon-reload
   if [ "$purge" = true ]; then
     rm -rf "$root"
-    success "AppPanel 已卸载，安装目录已删除: $root"
+    success "waf.farm 已卸载，安装目录已删除: $root"
   else
-    success "AppPanel 服务已卸载，安装目录已保留: $root"
+    success "waf.farm 服务已卸载，安装目录已保留: $root"
   fi
 }
 
 # --- APT 发行版官方源切换 ---
 # 只改 Debian/Ubuntu 官方套件条目的 URI（支持 one-line 与 DEB822 两种格式），
 # 第三方源（Caddy、PGDG、Docker 等）一律不动。路径可用环境变量覆盖以便测试：
-# APPPANEL_OS_RELEASE→/etc/os-release，APPPANEL_APT_ETC→/etc/apt，
-# APPPANEL_SKIP_APT_UPDATE=1 跳过改后验证。
-apt_os_release_file=${APPPANEL_OS_RELEASE:-/etc/os-release}
-apt_etc_dir=${APPPANEL_APT_ETC:-/etc/apt}
+# WAF_FARM_OS_RELEASE→/etc/os-release，WAF_FARM_APT_ETC→/etc/apt，
+# WAF_FARM_SKIP_APT_UPDATE=1 跳过改后验证。
+apt_os_release_file=${WAF_FARM_OS_RELEASE:-/etc/os-release}
+apt_etc_dir=${WAF_FARM_APT_ETC:-/etc/apt}
 
 mirror_choice_label() {
   case "$1" in tuna) printf '清华源' ;; official) printf '官方源' ;; *) printf '%s' "$1" ;; esac
@@ -849,7 +849,7 @@ switch_apt_mirror() {
   fi
   set -- $base_info
   main_base=$1; sec_base=$2
-  backup_dir="$apt_etc_dir/apppanel-mirror-backup-$(date '+%Y%m%d-%H%M%S')"
+  backup_dir="$apt_etc_dir/waf-farm-mirror-backup-$(date '+%Y%m%d-%H%M%S')"
   mkdir -p "$backup_dir" || fail "无法创建备份目录 $backup_dir"
   changed_files=0
   changed_list=""
@@ -892,7 +892,7 @@ switch_apt_mirror() {
     info "已取消，原文件保持不动"
     return
   fi
-  if [ "${APPPANEL_SKIP_APT_UPDATE:-0}" != "1" ]; then
+  if [ "${WAF_FARM_SKIP_APT_UPDATE:-0}" != "1" ]; then
     step "验证新源可用性（apt-get update）"
     update_log=$(mktemp) || fail "无法创建临时文件"
     if apt-get update >"$update_log" 2>&1; then
