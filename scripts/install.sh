@@ -441,7 +441,7 @@ install_or_update() {
   else
     root=${WAF_FARM_ROOT:-}
     [ -n "$root" ] || root=$(service_root)
-    [ -n "$root" ] && [ -x "$root/bin/waf-farm" ] || { echo "未检测到已安装的 AppPanel；请设置 WAF_FARM_ROOT 或选择安装面板" >&2; exit 1; }
+    [ -n "$root" ] && [ -x "$root/bin/waf-farm" ] || { echo "未检测到已安装的 waf.farm；请设置 WAF_FARM_ROOT 或选择安装面板" >&2; exit 1; }
   fi
 
   install_started_at=$(date '+%Y-%m-%d %H:%M:%S')
@@ -503,7 +503,7 @@ install_or_update() {
   done
   (cd "$package/caddy" && sha256sum -c caddy.sha256) || fail "定制 Caddy 校验失败"
   modules=$("$package/caddy/caddy" list-modules) || fail "无法读取定制 Caddy 模块"
-  printf '%s\n' "$modules" | grep -qx 'http.handlers.waf_farm_waf' || fail "定制 Caddy 缺少 AppPanel WAF 模块"
+  printf '%s\n' "$modules" | grep -qx 'http.handlers.waf_farm_waf' || fail "定制 Caddy 缺少 waf.farm WAF 模块"
   printf '%s\n' "$modules" | grep -qx 'http.handlers.lua_waf' || fail "定制 Caddy 缺少旧配置兼容模块"
   printf '%s\n' "$modules" | grep -qx 'http.handlers.rate_limit' || fail "定制 Caddy 缺少限流模块"
   release_helpers=""
